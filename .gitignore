@@ -1,0 +1,9 @@
+# Virtual Environment
+venv/
+.env
+
+# Project Data (Large Files)
+crypto_data_4h/
+crypto_data_parquet/
+*.zip
+*.csv
