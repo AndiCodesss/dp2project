@@ -1,7 +1,7 @@
 # Virtual Environment
 venv/
 .env
-
+venv_wsl/
 # Project Data (Large Files)
 crypto_data_4h/
 crypto_data_parquet/

@@ -18,6 +18,7 @@ Pipeline Stages:
 
 import os
 import sys
+import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -85,16 +86,15 @@ def stage1_ingest_data(spark: SparkSession):
         if not csv_files:
             raise FileNotFoundError(f"No CSVs in {CSV_FALLBACK}")
         
-        # Define schema for CSV manually to avoid inference overhead
-        from pyspark.sql.types import StructType, StructField, DoubleType, LongType
+        # Define schema for CSV (new datetime-based format)
+        from pyspark.sql.types import StructType, StructField, DoubleType, LongType, StringType
         schema = StructType([
-            StructField("open_time", LongType(), True),
+            StructField("datetime", StringType(), True),
             StructField("open", DoubleType(), True),
             StructField("high", DoubleType(), True),
             StructField("low", DoubleType(), True),
             StructField("close", DoubleType(), True),
             StructField("volume", DoubleType(), True),
-            StructField("close_time", LongType(), True),
             StructField("quote_volume", DoubleType(), True),
             StructField("trades", LongType(), True),
             StructField("taker_buy_base", DoubleType(), True),
@@ -102,19 +102,17 @@ def stage1_ingest_data(spark: SparkSession):
             StructField("ignore", DoubleType(), True),
         ])
         
-        df = spark.read.csv(csv_files, schema=schema, header=False)
+        df = spark.read.csv(csv_files, schema=schema, header=True)
         df = df.withColumn("_filename", F.input_file_name())
         df = df.withColumn("symbol", F.regexp_extract(F.col("_filename"), r"([A-Z0-9]+)-\d+h-", 1))
-        # CSV open_time is in microseconds or milliseconds?
-        # We need to detect or assume. Based on analysis, it is microseconds.
-        # But we will convert to Float close price and just keep timestamp as Key.
-        df = df.withColumn("timestamp", F.col("open_time"))
+        # Convert datetime string to timestamp
+        df = df.withColumn("timestamp", F.to_timestamp(F.col("datetime"), "yyyy-MM-dd HH:mm:ss"))
     else:
         raise FileNotFoundError("No data found!")
 
-    # Select necessary columns
+    # Select necessary columns - timestamp is proper datetime type from parquet
     long_df = df.select(
-        F.col("timestamp").cast("long"), 
+        F.col("timestamp"), 
         F.col("symbol"), 
         F.col("close").cast("double")
     ).filter(F.col("close").isNotNull())
@@ -209,10 +207,217 @@ def stage3_correlation(long_df, symbols, spark):
     return corr_mat, valid_cols
 
 # =============================================================================
-# STAGE 4: PORTFOLIO
+# STAGE 3B: PCA ANALYSIS (ML Model #2)
 # =============================================================================
 
-def stage4_portfolio(metrics, corr_mat, symbols):
+def stage3b_pca_analysis(long_df, symbols, n_components=10):
+    """
+    Apply PCA to returns matrix to find independent market factors.
+    Alternative to correlation filtering.
+    """
+    print(f"\n--- Stage 3B: PCA Analysis (n_components={n_components}) ---")
+    
+    from pyspark.ml.feature import PCA
+    
+    # Prepare returns matrix (same as correlation)
+    window = Window.partitionBy("symbol").orderBy("timestamp")
+    df = long_df.withColumn("prev", F.lag("close").over(window))
+    df = df.withColumn("ret", F.log(F.col("close") / F.col("prev")))
+    df = df.filter(F.col("ret").isNotNull()).select("timestamp", "symbol", "ret")
+    
+    # Pivot Returns
+    wide_ret = df.groupBy("timestamp").pivot("symbol", symbols).agg(F.first("ret"))
+    wide_ret = wide_ret.fillna(0)
+    
+    # VectorAssembler
+    valid_cols = [c for c in symbols if c in wide_ret.columns]
+    assembler = VectorAssembler(inputCols=valid_cols, outputCol="features")
+    vec_df = assembler.transform(wide_ret).select("features")
+    
+    # Apply PCA
+    pca = PCA(k=min(n_components, len(valid_cols)), inputCol="features", outputCol="pca_features")
+    model = pca.fit(vec_df)
+    
+    # Get explained variance
+    explained_variance = model.explainedVariance.toArray()
+    cumsum_variance = np.cumsum(explained_variance)
+    
+    print(f"\nExplained Variance by Component:")
+    for i, (var, cum_var) in enumerate(zip(explained_variance[:5], cumsum_variance[:5])):
+        print(f"  PC{i+1}: {var*100:.2f}% (Cumulative: {cum_var*100:.2f}%)")
+    
+    print(f"\nTotal variance explained by {n_components} components: {cumsum_variance[-1]*100:.2f}%")
+    
+    # Transform data
+    transformed = model.transform(vec_df)
+    
+    return model, explained_variance, valid_cols
+
+
+# =============================================================================
+# STAGE 4: K-MEANS CLUSTERING
+# =============================================================================
+
+def stage4_kmeans_clustering(metrics, n_clusters=5):
+    """
+    Cluster cryptocurrencies by risk/return profiles.
+    Select top performer from each cluster for diversification.
+    """
+    print(f"\n--- Stage 4: K-Means Clustering (k={n_clusters}) ---")
+    
+    from pyspark.ml.clustering import KMeans
+    from pyspark.ml.feature import VectorAssembler, StandardScaler
+    from pyspark.ml.evaluation import ClusteringEvaluator
+    
+    # Prepare features: annual_ret, annual_vol, sharpe
+    features = ["annual_ret", "annual_vol", "sharpe"]
+    
+    # Assemble features
+    assembler = VectorAssembler(inputCols=features, outputCol="features_raw")
+    df_features = assembler.transform(metrics)
+    
+    # Standardize (critical for K-Means - features have different scales)
+    scaler = StandardScaler(inputCol="features_raw", outputCol="features",
+                           withStd=True, withMean=True)
+    scaler_model = scaler.fit(df_features)
+    df_scaled = scaler_model.transform(df_features)
+    
+    # Train K-Means
+    kmeans = KMeans(k=n_clusters, seed=42, featuresCol="features", predictionCol="cluster")
+    model = kmeans.fit(df_scaled)
+    
+    # Make predictions
+    clustered = model.transform(df_scaled)
+    
+    # Evaluate clustering quality (Silhouette score)
+    evaluator = ClusteringEvaluator(featuresCol="features", predictionCol="cluster", metricName="silhouette")
+    silhouette = evaluator.evaluate(clustered)
+    print(f"Silhouette Score: {silhouette:.3f} (higher is better, range: -1 to 1)")
+    
+    # Show cluster statistics
+    cluster_stats = clustered.groupBy("cluster").agg(
+        F.count("symbol").alias("count"),
+        F.avg("sharpe").alias("avg_sharpe"),
+        F.avg("annual_vol").alias("avg_vol"),
+        F.avg("annual_ret").alias("avg_ret")
+    ).orderBy("cluster")
+    
+    print("\nCluster Statistics:")
+    cluster_stats.show()
+    
+    # Select top asset from each cluster (by Sharpe ratio)
+    from pyspark.sql import Window
+    window = Window.partitionBy("cluster").orderBy(F.desc("sharpe"))
+    
+    cluster_leaders = clustered.withColumn("rank", F.row_number().over(window)) \
+                              .filter(F.col("rank") == 1) \
+                              .select("symbol", "cluster", "sharpe", "annual_ret", "annual_vol")
+    
+    print(f"\nSelected {cluster_leaders.count()} cluster representatives:")
+    cluster_leaders.show()
+    
+    return clustered, cluster_leaders, model
+
+# =============================================================================
+# STAGE 4B: FEATURE ENGINEERING FOR GBT
+# =============================================================================
+
+def engineer_features_for_gbt(long_df):
+    """Create technical features from OHLCV data for GBT prediction."""
+    print("\n--- Feature Engineering for GBT ---")
+    
+    window = Window.partitionBy("symbol").orderBy("timestamp")
+    
+    # Lagged returns
+    df = long_df.withColumn("prev_close", F.lag("close").over(window))
+    df = df.withColumn("log_ret", F.log(F.col("close") / F.col("prev_close")))
+    df = df.withColumn("ret_lag1", F.lag("log_ret", 1).over(window))
+    df = df.withColumn("ret_lag2", F.lag("log_ret", 2).over(window))
+    df = df.withColumn("ret_lag3", F.lag("log_ret", 3).over(window))
+    
+    # Moving averages (7 and 30 periods)
+    ma7 = F.avg("close").over(window.rowsBetween(-6, 0))
+    ma30 = F.avg("close").over(window.rowsBetween(-29, 0))
+    df = df.withColumn("ma7", ma7)
+    df = df.withColumn("ma30", ma30)
+    df = df.withColumn("ma_ratio", ma7 / ma30)
+    
+    # Rolling volatility (7-period)
+    vol7 = F.stddev("log_ret").over(window.rowsBetween(-6, 0))
+    df = df.withColumn("volatility_7d", vol7)
+    
+    # Target: next period return
+    df = df.withColumn("target", F.lead("log_ret", 1).over(window))
+    
+    # Drop nulls
+    df = df.dropna()
+    
+    feature_cols = ["ret_lag1", "ret_lag2", "ret_lag3", "ma_ratio", "volatility_7d"]
+    print(f"Engineered {len(feature_cols)} features: {feature_cols}")
+    
+    return df, feature_cols
+
+# =============================================================================
+# STAGE 4C: GBT PREDICTION (ML Model #3)
+# =============================================================================
+
+def stage4c_gbt_prediction(long_df):
+    """
+    Train Gradient Boosted Trees to predict future returns.
+    Use predictions for forward-looking portfolio weights.
+    """
+    print("\n--- Stage 4C: Gradient Boosted Trees Regression ---")
+    
+    from pyspark.ml.regression import GBTRegressor
+    from pyspark.ml.evaluation import RegressionEvaluator
+    from pyspark.ml.feature import VectorAssembler
+    
+    # Engineer features
+    df, feature_cols = engineer_features_for_gbt(long_df)
+    
+    # Assemble features
+    assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
+    df = assembler.transform(df).select("symbol", "features", "target")
+    
+    # Train/Test split (80/20)
+    train, test = df.randomSplit([0.8, 0.2], seed=42)
+    
+    print(f"Training set: {train.count()} rows")
+    print(f"Test set: {test.count()} rows")
+    
+    # Train GBT
+    gbt = GBTRegressor(featuresCol="features", labelCol="target",
+                       maxIter=20, maxDepth=5, seed=42)
+    model = gbt.fit(train)
+    
+    # Evaluate
+    predictions = model.transform(test)
+    evaluator = RegressionEvaluator(labelCol="target", predictionCol="prediction", metricName="rmse")
+    rmse = evaluator.evaluate(predictions)
+    
+    print(f"\nModel Performance:")
+    print(f"  RMSE: {rmse:.6f}")
+    
+    # Feature importance
+    importance = model.featureImportances.toArray()
+    importance_df = pd.DataFrame({
+        'feature': feature_cols,
+        'importance': importance
+    }).sort_values('importance', ascending=False)
+    
+    print("\nFeature Importance:")
+    print(importance_df.to_string(index=False))
+    
+    # Predict on all data for portfolio construction
+    full_predictions = model.transform(df.select("symbol", "features"))
+    
+    return model, rmse, importance_df, full_predictions
+
+# =============================================================================
+# STAGE 5: PORTFOLIO (CORRELATION-BASED)
+# =============================================================================
+
+def stage5_portfolio(metrics, corr_mat, symbols):
     print("\n--- Stage 4: Tournament Filter ---")
     
     # Bring metrics to driver for filtering (small data: 2000 rows)
@@ -287,19 +492,97 @@ def main():
         # 3. Correlation (On Returns!)
         corr_mat, valid_symbols = stage3_correlation(long_df, symbols, spark)
         
-        # 4. Portfolio
-        final_df, _ = stage4_portfolio(metrics, corr_mat, valid_symbols)
+        # 3B. PCA Analysis (ML Model #2)
+        pca_model, explained_var, pca_symbols = stage3b_pca_analysis(long_df, symbols, n_components=10)
+        
+        # 4. K-Means Clustering (ML Model #1)
+        clustered, cluster_leaders, kmeans_model = stage4_kmeans_clustering(metrics, n_clusters=5)
+        
+        # 4C. GBT Prediction (ML Model #3)
+        gbt_model, gbt_rmse, feature_importance, gbt_predictions = stage4c_gbt_prediction(long_df)
+        
+        # 5. Portfolio (Correlation-based baseline)
+        final_df, _ = stage5_portfolio(metrics, corr_mat, valid_symbols)
         
         # Save
         os.makedirs(OUTPUT_FOLDER, exist_ok=True)
         final_df.to_csv(f"{OUTPUT_FOLDER}/smart_index.csv")
+        
+        # Save K-Means results
+        clustered.select("symbol", "cluster", "sharpe", "annual_ret", "annual_vol") \
+                .toPandas().to_csv(f"{OUTPUT_FOLDER}/kmeans_clusters.csv", index=False)
+        cluster_leaders.toPandas().to_csv(f"{OUTPUT_FOLDER}/kmeans_portfolio.csv", index=False)
         
         # Visualize
         plt.figure(figsize=(10,10))
         sns.heatmap(corr_mat, cmap="coolwarm", center=0)
         plt.title("Correlation Matrix")
         plt.savefig(f"{OUTPUT_FOLDER}/correlation_matrix.png")
-        print("\nPipeline Done.")
+        
+        # K-Means scatter plot
+        cluster_pdf = clustered.select("annual_ret", "annual_vol", "sharpe", "cluster").toPandas()
+        plt.figure(figsize=(10, 8))
+        scatter = plt.scatter(cluster_pdf["annual_vol"], cluster_pdf["sharpe"], 
+                             c=cluster_pdf["cluster"], cmap="viridis", s=100, alpha=0.6)
+        plt.xlabel("Annualized Volatility")
+        plt.ylabel("Sharpe Ratio")
+        plt.title("K-Means Clustering: Risk vs Return Profile")
+        plt.colorbar(scatter, label="Cluster")
+        plt.grid(True, alpha=0.3)
+        plt.savefig(f"{OUTPUT_FOLDER}/kmeans_clusters_viz.png")
+        
+        # PCA Scree Plot
+        plt.figure(figsize=(10, 6))
+        cumsum_var = np.cumsum(explained_var)
+        plt.subplot(1, 2, 1)
+        plt.bar(range(1, len(explained_var)+1), explained_var)
+        plt.xlabel("Principal Component")
+        plt.ylabel("Explained Variance")
+        plt.title("PCA: Explained Variance by Component")
+        plt.grid(True, alpha=0.3)
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(range(1, len(cumsum_var)+1), cumsum_var * 100, marker='o')
+        plt.xlabel("Number of Components")
+        plt.ylabel("Cumulative Explained Variance (%)")
+        plt.title("PCA: Cumulative Explained Variance")
+        plt.grid(True, alpha=0.3)
+        plt.axhline(y=90, color='r', linestyle='--', label='90% threshold')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(f"{OUTPUT_FOLDER}/pca_scree_plot.png")
+        
+        # Save PCA results
+        pca_results = pd.DataFrame({
+            'component': [f'PC{i+1}' for i in range(len(explained_var))],
+            'explained_variance': explained_var,
+            'cumulative_variance': cumsum_var
+        })
+        pca_results.to_csv(f"{OUTPUT_FOLDER}/pca_components.csv", index=False)
+        
+        # GBT Feature Importance Plot
+        plt.figure(figsize=(10, 6))
+        plt.barh(feature_importance['feature'], feature_importance['importance'])
+        plt.xlabel("Importance")
+        plt.ylabel("Feature")
+        plt.title(f"GBT Feature Importance (RMSE: {gbt_rmse:.6f})")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f"{OUTPUT_FOLDER}/gbt_feature_importance.png")
+        
+        # Save GBT results
+        feature_importance.to_csv(f"{OUTPUT_FOLDER}/gbt_feature_importance.csv", index=False)
+        
+        print("\n✅ Pipeline Done.")
+        print(f"Outputs saved to {OUTPUT_FOLDER}/:")
+        print("  - smart_index.csv (correlation-based portfolio)")
+        print("  - kmeans_clusters.csv (cluster assignments)")
+        print("  - kmeans_portfolio.csv (cluster-based portfolio)")
+        print("  - kmeans_clusters_viz.png (cluster visualization)")
+        print("  - pca_components.csv (principal components & variance)")
+        print("  - pca_scree_plot.png (PCA variance visualization)")
+        print("  - gbt_feature_importance.csv (GBT model feature importance)")
+        print("  - gbt_feature_importance.png (feature importance visualization)")
         
     except Exception as e:
         print(f"\nCRITICAL ERROR: {e}")

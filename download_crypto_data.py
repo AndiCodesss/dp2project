@@ -82,10 +82,10 @@ PARQUET_FOLDER = "crypto_data_parquet"
 # Download settings
 MAX_WORKERS = 10
 
-# Binance columns
+# Binance columns - simplified with human-readable datetime
 COLUMNS = [
-    "open_time", "open", "high", "low", "close", "volume",
-    "close_time", "quote_volume", "trades", "taker_buy_base",
+    "datetime", "open", "high", "low", "close", "volume",
+    "quote_volume", "trades", "taker_buy_base",
     "taker_buy_quote", "ignore"
 ]
 
@@ -93,24 +93,35 @@ COLUMNS = [
 # DOWNLOAD FUNCTIONS
 # =============================================================================
 
-def add_header_to_csv(csv_path: str, columns: List[str]):
-    """Add header row to a CSV file if it doesn't have one."""
+def add_header_to_csv(csv_file, columns):
+    """Convert raw timestamp CSV to datetime format with headers."""
     try:
-        # Read the file
-        with open(csv_path, 'r') as f:
-            content = f.read()
+        with open(csv_file, 'r') as f:
+            lines = f.readlines()
         
-        # Check if first line looks like header (contains letters)
-        first_line = content.split('\n')[0]
-        if any(c.isalpha() for c in first_line):
-            return  # Already has header
+        # Check if already processed (has datetime in header)
+        if lines and 'datetime' in lines[0]:
+            return
         
-        # Add header
-        header = ','.join(columns) + '\n'
-        with open(csv_path, 'w') as f:
-            f.write(header + content)
+        # Convert timestamps and write with header
+        with open(csv_file, 'w', newline='') as f:
+            f.write(','.join(columns) + '\n')
+            
+            for line in lines:
+                if line.strip() and not any(c.isalpha() for c in line.split(',')[0]):
+                    parts = line.strip().split(',')
+                    if len(parts) >= 12:  # Original Binance format
+                        # Convert microsecond timestamp to datetime
+                        timestamp_us = int(parts[0])
+                        dt = pd.to_datetime(timestamp_us // 1000, unit='ms')
+                        datetime_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+                        
+                        # Reconstruct line: datetime, open, high, low, close, volume, quote_volume, ...
+                        # Skip open_time (parts[0]) and close_time (parts[6])
+                        new_line = f"{datetime_str},{parts[1]},{parts[2]},{parts[3]},{parts[4]},{parts[5]},{parts[7]},{parts[8]},{parts[9]},{parts[10]},{parts[11]}\n"
+                        f.write(new_line)
     except Exception as e:
-        pass  # Silently fail to not interrupt download process
+        print(f"Error processing {csv_file}: {e}")
 
 def generate_year_months(start_year: int, start_month: int, 
                           end_year: int, end_month: int) -> List[Tuple[str, str]]:
@@ -199,31 +210,31 @@ def convert_single_csv(csv_file, parquet_folder):
         
         # Read CSV with appropriate parameters
         if has_header:
-            df = pd.read_csv(csv_file, header=0)  # Use first row as header
+            df = pd.read_csv(csv_file, header=0)
         else:
-            df = pd.read_csv(csv_file, names=COLUMNS, header=None)  # No header
+            df = pd.read_csv(csv_file, names=COLUMNS, header=None)
         
         # Add symbol column
         df["symbol"] = symbol
         
-        # Convert timestamp to datetime (Input is in microseconds for 4h data?)
-        # Verified: 1764547200000000 (us) -> 2025/12.
-        df["timestamp"] = pd.to_datetime(df["open_time"], unit="us")
+        # Parse datetime column (already in readable format)
+        df["timestamp"] = pd.to_datetime(df["datetime"])
         df["year"] = df["timestamp"].dt.year
         df["month"] = df["timestamp"].dt.month
         
-        # Select columns
+        # Select columns for parquet
         keep_cols = ["timestamp", "symbol", "open", "high", "low", "close", "volume", "year", "month"]
         df = df[keep_cols]
         
-        # Write to partitioned Parquet
+        # Write to partitioned Parquet with millisecond precision (Spark-compatible)
         # Partition schema: parquet_folder/year=2025/month=12/part-xyz.parquet
         df.to_parquet(
             parquet_folder,
             partition_cols=["year", "month"],
             engine="pyarrow",
             compression="snappy",
-            index=False
+            index=False,
+            coerce_timestamps='ms'  # Force millisecond precision for Spark compatibility
         )
         return True, symbol, "OK"
     except Exception as e:
