@@ -93,6 +93,25 @@ COLUMNS = [
 # DOWNLOAD FUNCTIONS
 # =============================================================================
 
+def add_header_to_csv(csv_path: str, columns: List[str]):
+    """Add header row to a CSV file if it doesn't have one."""
+    try:
+        # Read the file
+        with open(csv_path, 'r') as f:
+            content = f.read()
+        
+        # Check if first line looks like header (contains letters)
+        first_line = content.split('\n')[0]
+        if any(c.isalpha() for c in first_line):
+            return  # Already has header
+        
+        # Add header
+        header = ','.join(columns) + '\n'
+        with open(csv_path, 'w') as f:
+            f.write(header + content)
+    except Exception as e:
+        pass  # Silently fail to not interrupt download process
+
 def generate_year_months(start_year: int, start_month: int, 
                           end_year: int, end_month: int) -> List[Tuple[str, str]]:
     periods = []
@@ -112,6 +131,13 @@ def download_file(pair: str, year: str, month: str, interval: str,
         if response.status_code == 200:
             with zipfile.ZipFile(io.BytesIO(response.content)) as z:
                 z.extractall(save_folder)
+            
+            # Add header to extracted CSV
+            csv_name = file_name.replace('.zip', '.csv')
+            csv_path = os.path.join(save_folder, csv_name)
+            if os.path.exists(csv_path):
+                add_header_to_csv(csv_path, COLUMNS)
+            
             return (pair, year, month, True, "OK")
         else:
             return (pair, year, month, False, f"HTTP {response.status_code}")
@@ -165,8 +191,17 @@ def convert_single_csv(csv_file, parquet_folder):
             return False, filename, "Invalid filename format"
             
         symbol = parts[0]
-        # Read CSV
-        df = pd.read_csv(csv_file, names=COLUMNS)
+        
+        # Check if CSV has header by reading first line
+        with open(csv_file, 'r') as f:
+            first_line = f.readline().strip()
+            has_header = any(c.isalpha() for c in first_line)
+        
+        # Read CSV with appropriate parameters
+        if has_header:
+            df = pd.read_csv(csv_file, header=0)  # Use first row as header
+        else:
+            df = pd.read_csv(csv_file, names=COLUMNS, header=None)  # No header
         
         # Add symbol column
         df["symbol"] = symbol
@@ -259,7 +294,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-convert", action="store_true")
     parser.add_argument("--convert-only", action="store_true")
+    parser.add_argument("--add-headers", action="store_true", help="Add headers to existing CSV files")
     args = parser.parse_args()
+    
+    # Add headers to existing CSVs if requested
+    if args.add_headers:
+        print(f"\n{'='*60}\nADDING HEADERS TO EXISTING CSVs\n{'='*60}")
+        csv_files = glob.glob(os.path.join(CSV_FOLDER, "*.csv"))
+        for csv_file in csv_files:
+            add_header_to_csv(csv_file, COLUMNS)
+        print(f"✅ Added headers to {len(csv_files)} files.")
+        return
     
     # 1. Download
     if not args.convert_only:
@@ -268,7 +313,7 @@ def main():
     
     # 2. Convert & Cleanup
     if not args.skip_convert:
-        convert_to_parquet_pandas(CSV_FOLDER, PARQUET_FOLDER, delete_csv=True)
+        convert_to_parquet_pandas(CSV_FOLDER, PARQUET_FOLDER, delete_csv=False)
     
     print("\n✅ Process Complete!")
 
