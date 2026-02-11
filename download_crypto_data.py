@@ -66,10 +66,10 @@ TOP_PAIRS = [
 ]
 
 # Time period configuration
-START_YEAR = 2025
+START_YEAR = 2024
 END_YEAR = 2025
-START_MONTH = 12
-END_MONTH = 12
+START_MONTH = 12  # December 2024
+END_MONTH = 12    # December 2025
 INTERVAL = "4h"  # 4-hour candles
 
 # Base URL for Binance Public Data
