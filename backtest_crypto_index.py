@@ -52,6 +52,7 @@ TOP_N_ASSETS = 20
 N_CLUSTERS = 5
 N_PCA_COMPONENTS = 10
 TOP_PCA_ASSETS = 15
+TOP_GBT_ASSETS = 15  # Number of assets to select based on GBT predictions
 
 # Constants
 CANDLES_PER_DAY = 6  # 4-hour candles
@@ -478,6 +479,105 @@ def stage3d_portfolio_btc():
     })
 
 # =============================================================================
+# STAGE 3E: PORTFOLIO E - GBT PREDICTION STRATEGY
+# =============================================================================
+
+def engineer_features_for_gbt(long_df, month_id):
+    """Create technical features from price data for GBT prediction."""
+    # Filter to specific month
+    month_data = long_df.filter(F.col("month_id") == month_id)
+
+    window = Window.partitionBy("symbol").orderBy("timestamp")
+
+    # Lagged returns
+    df = month_data.withColumn("prev_close", F.lag("close").over(window))
+    df = df.withColumn("log_ret", F.log(F.col("close") / F.col("prev_close")))
+    df = df.withColumn("ret_lag1", F.lag("log_ret", 1).over(window))
+    df = df.withColumn("ret_lag2", F.lag("log_ret", 2).over(window))
+    df = df.withColumn("ret_lag3", F.lag("log_ret", 3).over(window))
+
+    # Moving averages (7 and 30 periods)
+    ma7 = F.avg("close").over(window.rowsBetween(-6, 0))
+    ma30 = F.avg("close").over(window.rowsBetween(-29, 0))
+    df = df.withColumn("ma7", ma7)
+    df = df.withColumn("ma30", ma30)
+    df = df.withColumn("ma_ratio", ma7 / ma30)
+
+    # Rolling volatility (7-period)
+    vol7 = F.stddev("log_ret").over(window.rowsBetween(-6, 0))
+    df = df.withColumn("volatility_7d", vol7)
+
+    # Target: next period return
+    df = df.withColumn("target", F.lead("log_ret", 1).over(window))
+
+    # Drop nulls
+    df = df.dropna()
+
+    feature_cols = ["ret_lag1", "ret_lag2", "ret_lag3", "ma_ratio", "volatility_7d"]
+
+    return df, feature_cols
+
+def stage3e_portfolio_gbt(long_df, month_id):
+    """
+    GBT prediction-based strategy.
+
+    Algorithm:
+    1. Engineer technical features (lagged returns, moving averages, volatility)
+    2. Train GBT Regressor to predict next-period returns
+    3. Predict expected returns for all assets
+    4. Select top N assets by predicted return
+    5. Weight by normalized predicted return (higher prediction = higher weight)
+
+    Returns:
+        DataFrame with (symbol, weight, predicted_return)
+    """
+    from pyspark.ml.regression import GBTRegressor
+    from pyspark.ml.feature import VectorAssembler
+
+    try:
+        # Engineer features
+        df, feature_cols = engineer_features_for_gbt(long_df, month_id)
+
+        # Assemble features
+        assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
+        df = assembler.transform(df).select("symbol", "features", "target")
+
+        # Train GBT
+        gbt = GBTRegressor(featuresCol="features", labelCol="target",
+                          maxIter=20, maxDepth=5, seed=42)
+        model = gbt.fit(df)
+
+        # Make predictions on all data
+        predictions = model.transform(df.select("symbol", "features"))
+
+        # Aggregate predictions by symbol (take mean prediction)
+        symbol_predictions = predictions.groupBy("symbol").agg(
+            F.mean("prediction").alias("predicted_return")
+        )
+
+        # Convert to pandas for portfolio construction
+        pred_pdf = symbol_predictions.toPandas()
+
+        # Select top N by predicted return
+        pred_pdf = pred_pdf.sort_values('predicted_return', ascending=False).head(TOP_GBT_ASSETS)
+
+        # Weight by normalized predicted return (shift to make all positive)
+        # Add constant to ensure all weights are positive
+        min_pred = pred_pdf['predicted_return'].min()
+        if min_pred < 0:
+            pred_pdf['adj_pred'] = pred_pdf['predicted_return'] - min_pred + 0.001
+        else:
+            pred_pdf['adj_pred'] = pred_pdf['predicted_return'] + 0.001
+
+        pred_pdf['weight'] = pred_pdf['adj_pred'] / pred_pdf['adj_pred'].sum()
+
+        return pred_pdf[['symbol', 'weight', 'predicted_return']]
+
+    except Exception as e:
+        # If GBT fails, return empty DataFrame
+        return pd.DataFrame({'symbol': [], 'weight': [], 'predicted_return': []})
+
+# =============================================================================
 # STAGE 4: BACKTEST EXECUTION
 # =============================================================================
 
@@ -589,6 +689,19 @@ def stage4_run_backtest(long_df, symbols, month_pairs):
             print(f"    Portfolio D FAILED: {e}")
             ret_d, n_d = 0.0, 0
 
+        # Strategy E: GBT Prediction
+        try:
+            weights_e = stage3e_portfolio_gbt(long_df, lookback_month)
+            if len(weights_e) > 0:
+                ret_e, n_e = stage4_backtest_month(long_df, weights_e, holding_month)
+                print(f"    Portfolio E (GBT): {n_e} assets, return: {ret_e:+.4f}")
+            else:
+                ret_e, n_e = 0.0, 0
+                print(f"    Portfolio E (GBT): FAILED (no predictions)")
+        except Exception as e:
+            print(f"    Portfolio E FAILED: {e}")
+            ret_e, n_e = 0.0, 0
+
         # Store results
         results.append({
             'month': backtest_month,
@@ -613,6 +726,12 @@ def stage4_run_backtest(long_df, symbols, month_pairs):
             'strategy': 'D',
             'month_return': ret_d,
             'num_assets': n_d
+        })
+        results.append({
+            'month': backtest_month,
+            'strategy': 'E',
+            'month_return': ret_e,
+            'num_assets': n_e
         })
 
     results_df = pd.DataFrame(results)
@@ -646,7 +765,7 @@ def stage5_calculate_performance(results_df):
     performance = []
     equity_data = []
 
-    for strategy in ['A', 'B', 'C', 'D']:
+    for strategy in ['A', 'B', 'C', 'D', 'E']:
         strategy_data = results_df[results_df['strategy'] == strategy].copy()
         strategy_data = strategy_data.sort_values('month')
 
@@ -731,18 +850,19 @@ def stage6_visualize(results_df, performance_df, equity_df, output_folder):
     gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
 
     # Define colors for strategies
-    colors = {'A': '#1f77b4', 'B': '#ff7f0e', 'C': '#2ca02c', 'D': '#d62728'}
+    colors = {'A': '#1f77b4', 'B': '#ff7f0e', 'C': '#2ca02c', 'D': '#d62728', 'E': '#9467bd'}
     strategy_names = {
         'A': 'Correlation-based (Top 20)',
         'B': 'K-Means Clustering (5 clusters)',
         'C': 'PCA Components (Top 15)',
-        'D': 'BTC Buy & Hold (Benchmark)'
+        'D': 'BTC Buy & Hold (Benchmark)',
+        'E': 'GBT Prediction (Top 15)'
     }
 
     # Plot 1: Equity Curves
     ax1 = fig.add_subplot(gs[0, :])
 
-    for strategy in ['A', 'B', 'C', 'D']:
+    for strategy in ['A', 'B', 'C', 'D', 'E']:
         strategy_equity = equity_df[equity_df['strategy'] == strategy].sort_values('month')
         months = [0] + strategy_equity['month'].tolist()
         values = [INITIAL_CAPITAL] + strategy_equity['portfolio_value'].tolist()
@@ -761,10 +881,10 @@ def stage6_visualize(results_df, performance_df, equity_df, output_folder):
     ax2 = fig.add_subplot(gs[1, 0])
 
     months = sorted(results_df['month'].unique())
-    width = 0.2
+    width = 0.16
     x = np.arange(len(months))
 
-    for i, strategy in enumerate(['A', 'B', 'C', 'D']):
+    for i, strategy in enumerate(['A', 'B', 'C', 'D', 'E']):
         strategy_returns = results_df[results_df['strategy'] == strategy].sort_values('month')
         returns = strategy_returns['month_return'].values * 100
         ax2.bar(x + i*width, returns, width, label=strategy_names[strategy], color=colors[strategy])
@@ -773,15 +893,15 @@ def stage6_visualize(results_df, performance_df, equity_df, output_folder):
     ax2.set_xlabel('Month', fontsize=10)
     ax2.set_ylabel('Return (%)', fontsize=10)
     ax2.set_title('Monthly Returns Comparison', fontsize=12, fontweight='bold')
-    ax2.set_xticks(x + width*1.5)
+    ax2.set_xticks(x + width*2)
     ax2.set_xticklabels(months)
-    ax2.legend(loc='best', fontsize=7)
+    ax2.legend(loc='best', fontsize=6)
     ax2.grid(True, alpha=0.3, axis='y')
 
     # Plot 3: Drawdown Analysis
     ax3 = fig.add_subplot(gs[1, 1])
 
-    for strategy in ['A', 'B', 'C', 'D']:
+    for strategy in ['A', 'B', 'C', 'D', 'E']:
         strategy_equity = equity_df[equity_df['strategy'] == strategy].sort_values('month')
         values = np.array([INITIAL_CAPITAL] + strategy_equity['portfolio_value'].tolist())
         running_max = np.maximum.accumulate(values)
@@ -795,7 +915,7 @@ def stage6_visualize(results_df, performance_df, equity_df, output_folder):
     ax3.set_xlabel('Month', fontsize=10)
     ax3.set_ylabel('Drawdown (%)', fontsize=10)
     ax3.set_title('Drawdown Analysis', fontsize=12, fontweight='bold')
-    ax3.legend(loc='best', fontsize=8)
+    ax3.legend(loc='best', fontsize=6)
     ax3.grid(True, alpha=0.3)
     ax3.set_xlim(0, 12)
 
@@ -834,7 +954,6 @@ def stage6_visualize(results_df, performance_df, equity_df, output_folder):
 
     # Color rows
     for i in range(len(table_data)):
-        strategy = ['A', 'B', 'C'][i]
         for j in range(len(headers)):
             table[(i+1, j)].set_facecolor('#f0f0f0' if i % 2 == 0 else 'white')
 
@@ -866,7 +985,7 @@ def main():
         print(f"Initial Capital: ${INITIAL_CAPITAL:,.2f}")
         print(f"Backtest Period: Feb 2025 - Dec 2025 (11 months)")
         print(f"Lookback Window: {LOOKBACK_MONTHS} month(s)")
-        print(f"Strategies: A (Correlation), B (K-Means), C (PCA), D (BTC Benchmark)")
+        print(f"Strategies: A (Correlation), B (K-Means), C (PCA), D (BTC), E (GBT)")
 
         # Stage 1: Ingest data
         long_df, symbols = stage1_ingest_data(spark)
@@ -926,6 +1045,7 @@ if __name__ == "__main__":
         'A': 'Correlation-based (Top 20)',
         'B': 'K-Means Clustering (5 clusters)',
         'C': 'PCA Components (Top 15)',
-        'D': 'BTC Buy & Hold (Benchmark)'
+        'D': 'BTC Buy & Hold (Benchmark)',
+        'E': 'GBT Prediction (Top 15)'
     }
     main()
