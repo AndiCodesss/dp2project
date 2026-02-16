@@ -1,105 +1,146 @@
-# Crypto Smart Index Engine
+# Crypto Index: ML-Driven Portfolio Construction and Backtesting
 
-A scalable Big Data analytics engine built with **Apache Spark** to construct a **"Smart Beta" cryptocurrency index**.
+A Spark-based pipeline that downloads cryptocurrency market data, applies four machine learning models from Spark MLlib, constructs diversified portfolios, and evaluates them through a rigorous 12-month backtest.
 
-Unlike standard market-cap weighted indices (which are dominated by highly correlated assets like BTC/ETH), this engine mathematically identifies a basket of assets that are **uncorrelated** and **risk-efficient**.
+## Project Structure
 
-## 🧠 The Strategy
-
-The core objective is to maximize the **Sharpe Ratio** (Risk-Adjusted Return) of the portfolio through a linear data pipeline:
-
-1.  **Ingestion & Alignment**: Ingests ragged time-series data for 100+ pairs (millions of rows) into a unified Master Matrix.
-2.  **Performance Scoring**: Calculates `Log Returns`, `Volatility` (Risk), and `Sharpe Ratio` for every asset using distributed Window Functions.
-3.  **Correlation "Tournament"**:
-    - Computes a massive Pearson Correlation Matrix (O(N²) complexity).
-    - Identifies pairs with correlation > **0.85**.
-    - **Prunes** the redundant asset with the lower Sharpe Ratio.
-4.  **Portfolio Weighting**: Constructs the final portfolio using **Inverse Volatility Weighting** to prioritize stability.
-
-## 🛠️ Technology Stack
-
-- **Apache Spark (PySpark)**: Distributed processing for ETL and ML tasks.
-- **Parquet**: Columnar storage for efficient I/O (millisecond precision timestamps).
-- **Environment**: Linux / WSL (Windows Subsystem for Linux) recommended for Spark.
-
-## 🚀 Usage
-
-### 1. Setup Environment (WSL/Linux Recommended)
-
-Spark runs best on POSIX systems. For Windows users, **WSL is highly recommended**.
-
-```bash
-# In your WSL terminal:
-pip install pyspark numpy pandas matplotlib seaborn pyarrow findspark
+```
+0842_Team1/
+├── 01_data_preparation.ipynb   # Data download and Parquet conversion
+├── 02_ml_models.ipynb          # ML models and portfolio construction
+├── 03_backtesting.ipynb        # Monthly rebalancing backtest
+├── report.pdf                  # Project report
+├── HTML/                       # Notebook HTML exports
+├── crypto_data_parquet/        # Generated: partitioned Parquet dataset
+├── crypto_data_4h/             # Generated: raw CSV files (can be deleted)
+└── output/                     # Generated: results, charts, CSV exports
 ```
 
-### 2. Download & Prepare Data
+## Notebooks
 
-Downloads Binance 4h-kline data, adds readable headers, and converts to optimized Parquet.
+### 01 — Data Preparation
 
-```bash
-python download_crypto_data.py
+Downloads 4-hour OHLCV candle data for ~600 USDT trading pairs from the Binance public data archive (Oct 2024 – Dec 2025) and converts it into year/month-partitioned Parquet files.
+
+**Pipeline steps:**
+1. Discover historical trading pairs via the Binance S3 archive
+2. Download monthly ZIP archives in parallel (10 workers)
+3. Parse raw CSVs — convert timestamps, add headers
+4. Write Snappy-compressed Parquet partitioned by `year/month` using Spark
+
+**Key outputs:**
+- `crypto_data_parquet/` — ~1.1M rows across ~500 symbols, ~40–60 MB on disk
+- Oct–Dec 2024 serves as warmup data (90-day lookback for indicators); Jan–Dec 2025 is the evaluation period
+
+**Runtime:** ~10 minutes (network-dependent)
+
+---
+
+### 02 — ML Models
+
+Applies four Spark MLlib models to the prepared data and constructs an investable portfolio.
+
+| Model | Purpose | Key Output |
+|-------|---------|------------|
+| **Pearson Correlation** | Identify redundant asset pairs | 150 x 150 correlation matrix, tournament-filtered assets |
+| **PCA** | Decompose returns into market factors | Scree plot, explained variance (PC1 captures ~55%) |
+| **K-Means Clustering** | Group assets by risk/return profile | 5 clusters, silhouette score ~0.47 |
+| **Gradient Boosted Trees** | Predict next-period returns | Feature importances, test RMSE |
+
+**Portfolio construction:** Correlation tournament (drop one asset from pairs with |rho| > 0.85) followed by top-20 selection by Sharpe ratio, weighted by inverse volatility.
+
+**Key outputs (in `output/`):**
+
+| File | Content |
+|------|---------|
+| `smart_index.csv` | Final portfolio: 20 symbols with weights |
+| `kmeans_clusters.csv` | Cluster assignments for all 500 assets |
+| `pca_components.csv` | Explained variance per principal component |
+| `gbt_feature_importance.csv` | Feature importances from the GBT model |
+| `correlation_matrix.png` | Correlation heatmap |
+| `kmeans_clusters_viz.png` | Cluster scatter plot (volatility vs. Sharpe) |
+| `pca_scree_plot.png` | Variance explained per component |
+| `gbt_feature_importance.png` | Feature importance bar chart |
+
+---
+
+### 03 — Backtesting
+
+Simulates five portfolio strategies with monthly rebalancing over Jan–Dec 2025 using a rolling 90-day lookback window.
+
+| Strategy | Method | Assets |
+|----------|--------|--------|
+| **A** | BTC buy-and-hold benchmark | 1 |
+| **B** | Correlation tournament + inverse-volatility weights | 20 |
+| **C** | K-Means cluster-balanced round-robin selection | 20 |
+| **D** | PCA residual variance (most market-independent assets) | 20 |
+| **E** | GBT predicted-return ranking | 20 |
+
+**Design principles:**
+- No lookahead bias — assets selected using only past data
+- Strict tradability — an asset must have an exact 4h candle at rebalance time
+- No transaction costs assumed (documented limitation)
+
+**Key outputs (in `output/`):**
+
+| File | Content |
+|------|---------|
+| `backtest_results.csv` | Monthly returns per strategy |
+| `backtest_performance.csv` | Annualized return, volatility, Sharpe, max drawdown, win rate |
+| `backtest_equity.csv` | Month-by-month portfolio values |
+| `backtest_comparison.png` | Equity curves, returns heatmap, drawdown chart, summary table |
+
+## Requirements
+
+- **Python 3.8+**
+- **Apache Spark 3.x** with PySpark
+- **Java 8 or 11** (required by Spark)
+
+Python packages:
+
+```
+pyspark
+findspark
+numpy
+matplotlib
+seaborn
+requests
 ```
 
-_Note: This generates CSVs with readable `datetime` columns AND partitions parquet files._
+## Quick Start
 
-### 3. Run Pipeline
+Run the notebooks in order:
 
-Run the full pipeline including ingestion, metrics, and all 3 ML models:
-
-```bash
-python spark_crypto_index.py
+```
+1. 01_data_preparation.ipynb   — downloads data, writes Parquet (~10 min)
+2. 02_ml_models.ipynb          — trains models, builds portfolio
+3. 03_backtesting.ipynb        — runs 12-month backtest, generates charts
 ```
 
-## 📊 Output
+Each notebook initializes its own Spark session. No shared state is required between sessions — only the `crypto_data_parquet/` directory produced by notebook 01 is needed by notebooks 02 and 03.
 
-All results are saved to the `output/` directory:
+## Configuration
 
-| Category    | File                         | Description                                            |
-| ----------- | ---------------------------- | ------------------------------------------------------ |
-| **Core**    | `smart_index.csv`            | Final index weights (Correlation + Inverse Volatility) |
-| **K-Means** | `kmeans_clusters.csv`        | Cluster assignments for all assets                     |
-|             | `kmeans_portfolio.csv`       | Top asset from each cluster                            |
-|             | `kmeans_clusters_viz.png`    | Scatter plot of clusters (Risk vs Return)              |
-| **PCA**     | `pca_components.csv`         | Principal components & variance explained              |
-|             | `pca_scree_plot.png`         | Variance explained visualization                       |
-| **GBT**     | `gbt_feature_importance.csv` | Feature importance from return prediction model        |
-|             | `gbt_feature_importance.png` | Feature importance visualization                       |
+Key parameters (editable in each notebook's configuration cell):
 
-## 🤖 Machine Learning Models
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `PAIR_MODE` | `historical-usdt` | Universe selection mode |
+| `LOOKBACK_DAYS` | 90 | Rolling window for model fitting |
+| `TOP_N_ASSETS` | 20 | Portfolio size |
+| `CORRELATION_THRESHOLD` | 0.85 | Redundancy filter cutoff |
+| `N_CLUSTERS` | 5 | K-Means cluster count |
+| `MAX_WIDE_MATRIX_SYMBOLS` | 150 | Cap for Spark codegen stability |
+| `INITIAL_CAPITAL` | $10,000 | Backtest starting value |
 
-This project demonstrates **three distinct machine learning models** using Apache Spark MLlib:
+## Data
 
-### 1. K-Means Clustering
+- **Source:** [Binance Public Data](https://data.binance.vision/) (4-hour spot klines)
+- **Period:** October 2024 – December 2025 (15 months)
+- **Universe:** ~500 USDT pairs (historical, excluding leveraged tokens)
+- **Volume:** ~1.1 million rows, ~40–60 MB compressed Parquet
 
-Groups cryptocurrencies into 5 clusters based on risk/return profiles (Sharpe ratio, volatility, returns).
+## License
 
-- **Output**: Cluster assignments + top performer from each cluster
-- **Evaluation**: Silhouette score for clustering quality
-- **Visualization**: Risk vs Return scatter plot colored by cluster
-
-### 2. PCA (Principal Component Analysis)
-
-Identifies independent market factors by reducing dimensionality of the returns correlation matrix.
-
-- **Output**: 10 principal components with explained variance ratios
-- **Analysis**: Shows how much variance each component captures
-- **Visualization**: Scree plot showing cumulative variance explained
-
-### 3. Gradient Boosted Trees (GBT)
-
-Predicts future returns using technical features (lagged returns, moving averages, volatility).
-
-- **Features**: 5 engineered features from OHLCV data
-- **Evaluation**: RMSE on 20% test set
-- **Output**: Feature importance rankings
-- **Visualization**: Horizontal bar chart of feature importance
-
-### Model Comparison
-
-The pipeline generates outputs for comparing:
-
-1. **Baseline**: Correlation-filtered + Sharpe-weighted index
-2. **K-Means**: Cluster-representative index
-3. **PCA**: Factor-based index (components available)
-4. **GBT**: Prediction-weighted index (future work)
+- **Code:** [MIT License](https://opensource.org/licenses/MIT)
+- **Report and figures:** [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
